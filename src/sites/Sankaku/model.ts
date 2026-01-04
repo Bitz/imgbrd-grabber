@@ -3,6 +3,9 @@ function buildSearch(search: string): string {
     return search.replace(/(^| )ratio:(\d+:\d+)($| )/g, "$1$2_aspect_ratio$3");
 }
 
+// Module-level storage for query parameters to enable keyset pagination
+let lastSearchParams = "";
+
 function buildImageFromJson(img: any): IImage {
     // Date conversion
     if (img.created_at && typeof img.created_at === "object" && typeof img.created_at.s === "string") {
@@ -135,15 +138,37 @@ export const source: ISource = {
         json: {
             name: "JSON",
             auth: [],
-            maxLimit: 200,
+            maxLimit: 100,
             search: {
                 url: (query: ISearchQuery, opts: IUrlOptions, previous: IPreviousSearch | undefined): IRequest => {
                     const isIdol = opts.baseUrl.indexOf("idol") !== -1;
                     const baseUrl = isIdol ? "https://i.sankakuapi.com" : "https://sankakuapi.com";
-                    const threshold = isIdol ? 2 : 5;
-                    const pagePart = Grabber.pageUrl(query.page, previous, opts.loggedIn ? 100 : 50, "page={page}", "prev={max}", "next={min-1}");
                     const search = buildSearch(query.search);
-                    const url = baseUrl + "/v2/posts/keyset?lang=en&default_threshold=" + threshold + "&hide_posts_in_books=in-larger-tags&limit=" + opts.limit + "&" + pagePart + "&tags=" + encodeURIComponent(search);
+                    
+                    // Build query parameters and store for pagination
+                    const queryParams = "lang=en&hide_posts_in_books=in-larger-tags&limit=" + opts.limit + "&tags=" + encodeURIComponent(search);
+                    lastSearchParams = queryParams;
+                    
+                    // Build URL with keyset pagination support
+                    let url = baseUrl + "/v2/posts/keyset?" + queryParams;
+                    
+                    // Append cursor from previous page if navigating
+                    if (previous && (previous as any).urls) {
+                        const prevUrls = (previous as any).urls;
+                        
+                        if (query.page > previous.page && prevUrls.next) {
+                            const match = prevUrls.next.match(/[&?]next=([^&]+)/);
+                            if (match) {
+                                url += "&next=" + match[1];
+                            }
+                        } else if (query.page < previous.page && prevUrls.prev) {
+                            const match = prevUrls.prev.match(/[&?]prev=([^&]+)/);
+                            if (match) {
+                                url += "&prev=" + match[1];
+                            }
+                        }
+                    }
+                    
                     return {
                         url,
                         headers: {
@@ -153,12 +178,14 @@ export const source: ISource = {
                 },
                 parse: (src: string, _statusCode: number): IParsedSearch => {
                     const data = JSON.parse(src);
+                    const meta = data.meta || {};
                     const posts: any[] = Array.isArray(data) ? data : (data.data || data.posts || []);
 
                     const images: IImage[] = [];
                     for (const post of posts) {
                         try {
-                            images.push(buildImageFromJson(post));
+                            const image = buildImageFromJson(post);
+                            images.push(image);
                         } catch {
                             // Skip invalid posts
                         }
@@ -166,11 +193,22 @@ export const source: ISource = {
 
                     const tags = Grabber.regexToTags('"type":(?<typeId>\\d+).*?"(?:name_en|tagName|name)":"(?<name>[^"]+)".*?"(?:post_)?count":(?<count>\\d+)', src) as ITag[];
                     applyTagTypes(tags);
-
-                    return {
+                    
+                    // Build pagination URLs with keyset cursors
+                    const result: any = {
                         images,
                         tags,
                     };
+                    
+                    const baseUrl = "https://sankakuapi.com";
+                    if (meta.next) {
+                        result.urlNextPage = baseUrl + "/v2/posts/keyset?" + lastSearchParams + "&next=" + encodeURIComponent(meta.next);
+                    }
+                    if (meta.prev) {
+                        result.urlPrevPage = baseUrl + "/v2/posts/keyset?" + lastSearchParams + "&prev=" + encodeURIComponent(meta.prev);
+                    }
+                    
+                    return result;
                 },
             },
             details: {
@@ -184,76 +222,6 @@ export const source: ISource = {
                     applyTagTypes(tags);
                     return { tags };
                 },
-            },
-        },
-        html: {
-            name: "Regex",
-            auth: [],
-            forcedLimit: 20,
-            forcedTokens: ["*"],
-            search: {
-                url: (query: ISearchQuery, opts: IUrlOptions, previous: IPreviousSearch | undefined): string | IError => {
-                    try {
-                        const pagePart = Grabber.pageUrl(query.page, previous, opts.loggedIn ? 50 : 25, "page={page}", "prev={max}", "next={min-1}");
-                        const search = buildSearch(query.search);
-                        return "/post/index?" + pagePart + "&tags=" + encodeURIComponent(search);
-                    } catch (e: any) {
-                        return { error: e && e.message ? e.message : String(e) };
-                    }
-                },
-                parse: (src: string, _statusCode: number): IParsedSearch => {
-                    const cleanedSrc = src.replace(/<div class="?popular-preview-post"?>[\s\S]+?<\/div>/g, "");
-                    const searchImageCounts = Grabber.regexMatches('class="?tag-(?:count|type-none)"? title="Post Count: (?<count>[0-9,]+)"', cleanedSrc);
-                    const lastPage = Grabber.regexToConst("page", '<span class="?current"?>\\s*(?<page>[0-9,]+)\\s*<\/span>\\s*>>\\s*<\/div>', cleanedSrc);
-                    let wiki = Grabber.regexToConst("wiki", '<div id="?wiki-excerpt"?[^>]*>(?<wiki>.+?)<\/div>', cleanedSrc);
-                    wiki = wiki ? wiki.replace(/href="\/wiki\/show\?title=([^"]+)"/g, 'href="$1"') : undefined;
-
-                    return {
-                        tags: Grabber.regexToTags('<li class="?[^">]*tag-type-(?<type>[^">]+)(?:|"[^>]*)>.*?<a href="[^"]+"[^>]*>(?<name>[^<]+)<\/a>.*?<span class="?post-count"?>(?<count>\\d+)<\/span>.*?<\/li>', cleanedSrc),
-                        images: Grabber.regexToImages('<span[^>]* id="?p(?<id>\\d+)"?><a[^>]*><img[^>]* src="(?<preview_url>[^"]+\/preview\/\\w{2}\/\\w{2}\/((?<md5>[^.]+))\\.[^"]+|[^"]+\/download-preview.png)" title="(?<tags>[^"]+)"[^>]+><\/a><\/span>', cleanedSrc).map((img: IImage) => completeImage(img, false)),
-                        wiki,
-                        pageCount: lastPage ? Grabber.countToInt(lastPage) : undefined,
-                        imageCount: searchImageCounts.length === 1 ? Grabber.countToInt(searchImageCounts[0].count) : undefined,
-                    };
-                },
-            },
-            details: {
-                url: (id: string, _md5: string): string => "/post/show/" + id,
-                parse: (src: string, _statusCode: number): IParsedDetails => {
-                    return {
-                        pools: Grabber.regexToPools('<div class="status-notice" id="pool\\d+">[^<]*Pool:[^<]*(?:<a href="/post/show/(?<previous>\\d+)" >&lt;&lt;<\/a>)?[^<]*<a href="/pool/show/(?<id>\\d+)" >(?<name>[^<]+)<\/a>[^<]*(?:<a href="/post/show/(?<next>\\d+)" >&gt;&gt;<\/a>)?[^<]*<\/div>', src),
-                        tags: Grabber.regexToTags('<li class="?[^">]*tag-type-(?<type>[^">]+)(?:|"[^>]*)>.*?<a href="[^"]+"[^>]*>(?<name>[^<]+)<\/a>.*?<span class="?post-count"?>(?<count>\\d+)<\/span>.*?<\/li>', src),
-                        imageUrl: Grabber.regexToConst("url", '<li>Original: <a href="(?<url>[^"]+)"|<a href="(?<url_2>[^"]+)">Save this file', src).replace(/&amp;/g, "&"),
-                        createdAt: Grabber.regexToConst("date", '<a href="/\\?tags=date[^"]+" title="(?<date>[^"]+)">', src),
-                    };
-                },
-            },
-            tagTypes: {
-                url: (): string => "/tag/index",
-                parse: (src: string, _statusCode: number): IParsedTagTypes | IError => {
-                    const contents = src.match(/<select[^>]* id=['"]?type['"]?[^>]*>([\s\S]+)<\/select>/);
-                    if (!contents) {
-                        return { error: "Parse error: could not find the tag type <select> tag" };
-                    }
-                    const results = Grabber.regexMatches('<option value="?(?<id>\\d+)"?>(?<name>[^<]+)<\/option>', contents[1]);
-                    const types = results.map((r: any) => ({
-                        id: parseInt(r.id, 10),
-                        name: String(r.name).toLowerCase(),
-                    }));
-                    return { types };
-                },
-            },
-            tags: {
-                url: (query: ITagsQuery, _opts: IUrlOptions): string => "/tag/index?language=en&order=" + query.order + "&page=" + query.page,
-                parse: (src: string, _statusCode: number): IParsedTags => {
-                    return {
-                        tags: Grabber.regexToTags('<tr[^>]*>\\s*<td[^>]*>(?<count>\\d+)<\/td>\\s*<td class="?tag-type-(?<type>[^">]+)"?>\\s*\\[<a[^>]+>\\?<\/a>\\]\\s*<a[^>]+>(?<name>.+?)<\/a>\\s*<\/td>', src),
-                    };
-                },
-            },
-            check: {
-                url: (): string => "/",
-                parse: (src: string, _statusCode: number): boolean => src.indexOf("Sankaku") !== -1,
             },
         },
     },
